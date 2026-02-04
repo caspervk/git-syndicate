@@ -21,7 +21,6 @@ opener = urllib.request.build_opener(
 class Repo:
     base_dir: Path
 
-    archived: bool
     clone_url: str
     default_branch: str
     description: str
@@ -33,38 +32,17 @@ class Repo:
     def path(self) -> Path:
         return self.base_dir.joinpath(self.name)
 
-    def is_remote_up_to_date(self, remote: str) -> bool:
-        print("git: is remote up to date?", remote)
-        refs_origin = subprocess.run(
-            ["git", "ls-remote", self.clone_url],
+    def clone(self) -> None:
+        print("git: clone", self.name)
+        # Cannot use `--mirror` due to
+        # https://stackoverflow.com/questions/34265266/remote-rejected-errors-after-mirroring-a-git-repository.
+        subprocess.run(
+            ["git", "clone", "--bare", self.clone_url, self.path],
             check=True,
-            capture_output=True,
         )
-        refs_remote = subprocess.run(
-            ["git", "ls-remote", remote],
-            check=True,
-            capture_output=True,
-        )
-        return refs_origin.stdout == refs_remote.stdout
-
-    def clone_or_update(self) -> None:
-        if not self.path.exists():
-            print("git: clone", self.name)
-            subprocess.run(
-                ["git", "clone", "--mirror", self.clone_url, self.path],
-                check=True,
-            )
-        else:
-            print("git: update", self.name)
-            subprocess.run(
-                ["git", "remote", "update", "--prune"],
-                cwd=self.path,
-                check=True,
-            )
 
     def push(self, remote: str) -> None:
         print("git: push", self.name, remote)
-        self.clone_or_update()
         subprocess.run(
             ["git", "push", "--mirror", remote],
             cwd=self.path,
@@ -73,20 +51,18 @@ class Repo:
 
 
 class Codeberg:
-    def __init__(self, token: str) -> None:
+    def __init__(self, username: str, token: str) -> None:
+        self.username = username
         self.token = token
 
     def sync(self, repo: Repo) -> None:
         print("codeberg: sync", repo.name)
-        remote = f"git@codeberg.org:caspervk/{repo.name}.git"
+        remote = f"git@codeberg.org:{self.username}/{repo.name}.git"
         self.create(repo.name)
-        if not repo.is_remote_up_to_date(remote):
-            self.update(name=repo.name, data={"archived": False})
-            repo.push(remote)
+        repo.push(remote)
         self.update(
             name=repo.name,
             data={
-                "archived": repo.archived,
                 "default_branch": repo.default_branch,
                 "description": repo.description,
                 "website": repo.html_url,
@@ -116,7 +92,7 @@ class Codeberg:
         print("codeberg: update", name)
         # https://codeberg.org/api/swagger
         request = Request(
-            url=f"https://codeberg.org/api/v1/repos/caspervk/{name}",
+            url=f"https://codeberg.org/api/v1/repos/{self.username}/{name}",
             method="PATCH",
             headers={
                 "authorization": f"token {self.token}",
@@ -128,48 +104,23 @@ class Codeberg:
 
 
 class Github:
-    def __init__(self, token: str) -> None:
+    def __init__(self, username: str, token: str) -> None:
+        self.username = username
         self.token = token
 
     def sync(self, repo: Repo) -> None:
         print("github: sync", repo.name)
-        remote = f"git@github.com:caspervk/{repo.name}.git"
+        remote = f"git@github.com:{self.username}/{repo.name}.git"
         self.create(repo.name)
-        if not repo.is_remote_up_to_date(remote):
-            self.update(name=repo.name, data={"archived": False})
-            repo.push(remote)
-        # GitHub's API can only update if the repo is unarchived. Unarchiving
-        # the repo updates the "This repository was archived by the owner on
-        # Jan 28, 2026." date, so we only unarchive and update if necessary.
-        current = self.get(repo.name)
-        if (
-            current["archived"] != repo.archived
-            or current["default_branch"] != repo.default_branch
-            or current["description"] != repo.description
-            or current["homepage"] != repo.html_url
-        ):
-            self.update(name=repo.name, data={"archived": False})
-            self.update(
-                name=repo.name,
-                data={
-                    "archived": repo.archived,
-                    "default_branch": repo.default_branch,
-                    "description": repo.description,
-                    "homepage": repo.html_url,
-                },
-            )
-
-    def get(self, name: str) -> dict:
-        print("github: get", name)
-        # https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#get-a-repository
-        request = Request(
-            url=f"https://api.github.com/repos/caspervk/{name}",
-            method="GET",
-            headers={
-                "x-github-api-version": "2022-11-28",
+        repo.push(remote)
+        self.update(
+            name=repo.name,
+            data={
+                "default_branch": repo.default_branch,
+                "description": repo.description,
+                "homepage": repo.html_url,
             },
         )
-        return json.load(opener.open(request))
 
     def create(self, name: str) -> None:
         print("github: create", name)
@@ -206,7 +157,7 @@ class Github:
         print("github: update", name)
         # https://docs.github.com/en/rest/repos/repos?apiVersion=2022-11-28#update-a-repository
         request = Request(
-            url=f"https://api.github.com/repos/caspervk/{name}",
+            url=f"https://api.github.com/repos/{self.username}/{name}",
             method="PATCH",
             headers={
                 "authorization": f"Bearer {self.token}",
@@ -219,30 +170,25 @@ class Github:
 
 
 class Gitlab:
-    def __init__(self, token: str) -> None:
+    def __init__(self, username: str, token: str) -> None:
+        self.username = username
         self.token = token
 
     def sync(self, repo: Repo) -> None:
         print("gitlab: sync", repo.name)
-        remote = f"git@gitlab.com:casperxx/{repo.name}.git"
+        remote = f"git@gitlab.com:{self.username}/{repo.name}.git"
         self.create(repo.name)
-        if not repo.is_remote_up_to_date(remote):
-            self.unarchive(repo.name)
-            repo.push(remote)
-        current = self.update(
+        # GitLab repos are created with a protected main branch by default,
+        # which means we're not allowed to force push. Unprotect all branches.
+        self.unprotect_all_branches(repo.name)
+        repo.push(remote)
+        self.update(
             name=repo.name,
             data={
                 "default_branch": repo.default_branch,
                 "description": repo.description + "\n\n" + repo.html_url,
             },
         )
-        # Gitlab says archive and unarchive is idempotent, but actually you're
-        # not allowed to archive a repo that is already archived.
-        if current["archived"] != repo.archived:
-            if repo.archived:
-                self.archive(repo.name)
-            else:
-                self.unarchive(repo.name)
 
     def create(self, name: str) -> None:
         print("gitlab: create", name)
@@ -272,7 +218,7 @@ class Gitlab:
         print("gitlab: update", name)
         # https://docs.gitlab.com/api/projects/#edit-a-project
         request = Request(
-            url=f"https://gitlab.com/api/v4/projects/casperxx%2F{name}",
+            url=f"https://gitlab.com/api/v4/projects/{self.username}%2F{name}",
             method="PUT",
             headers={
                 "content-type": "application/json",
@@ -282,42 +228,39 @@ class Gitlab:
         )
         return json.load(opener.open(request))
 
-    def archive(self, name: str) -> None:
-        print("gitlab: archive", name)
-        # https://docs.gitlab.com/api/projects/#archive-a-project
+    def unprotect_all_branches(self, name: str) -> None:
+        print("gitlab: unprotect all branches", name)
+        # https://docs.gitlab.com/api/protected_branches/#list-protected-branches
         request = Request(
-            url=f"https://gitlab.com/api/v4/projects/casperxx%2F{name}/archive",
-            method="POST",
+            url=f"https://gitlab.com/api/v4/projects/{self.username}%2F{name}/protected_branches",
+            method="GET",
             headers={
                 "private-token": self.token,
             },
         )
-        opener.open(request)
-
-    def unarchive(self, name: str) -> None:
-        print("gitlab: unarchive", name)
-        # https://docs.gitlab.com/api/projects/#unarchive-a-project
-        request = Request(
-            url=f"https://gitlab.com/api/v4/projects/casperxx%2F{name}/unarchive",
-            method="POST",
-            headers={
-                "private-token": self.token,
-            },
-        )
-        opener.open(request)
+        protected_branches = json.load(opener.open(request))
+        for branch in protected_branches:
+            # https://docs.gitlab.com/api/protected_branches/#unprotect-repository-branches
+            request = Request(
+                url=f"https://gitlab.com/api/v4/projects/{self.username}%2F{name}/protected_branches/{branch['name']}",
+                method="DELETE",
+                headers={
+                    "private-token": self.token,
+                },
+            )
+            opener.open(request)
 
 
 class Sourcehut:
-    def __init__(self, token: str) -> None:
+    def __init__(self, username: str, token: str) -> None:
+        self.username = username
         self.token = token
 
     def sync(self, repo: Repo) -> None:
         print("sourcehut: sync", repo.name)
-        remote = f"git@git.sr.ht:~caspervk/{repo.name}"
+        remote = f"git@git.sr.ht:~{self.username}/{repo.name}"
         self.create(repo.name)
-        if not repo.is_remote_up_to_date(remote):
-            # Can't archive repos, so no need to unarchive before pushing
-            repo.push(remote)
+        repo.push(remote)
         self.update(
             id=self.get(repo.name),
             data={
@@ -412,7 +355,6 @@ def get_repos(base_dir: Path) -> list[Repo]:
     return [
         Repo(
             base_dir=base_dir,
-            archived=r["archived"],
             clone_url=r["clone_url"],
             default_branch=r["default_branch"],
             description=r["description"],
@@ -425,10 +367,10 @@ def get_repos(base_dir: Path) -> list[Repo]:
 
 
 def main() -> None:
-    codeberg = Codeberg(config.CODEBERG_TOKEN)
-    github = Github(config.GITHUB_TOKEN)
-    gitlab = Gitlab(config.GITLAB_TOKEN)
-    sourcehut = Sourcehut(config.SOURCEHUT_TOKEN)
+    codeberg = Codeberg("caspervk", config.CODEBERG_TOKEN)
+    github = Github("caspervk", config.GITHUB_TOKEN)
+    gitlab = Gitlab("casperxx", config.GITLAB_TOKEN)
+    sourcehut = Sourcehut("caspervk", config.SOURCEHUT_TOKEN)
 
     # Read last run timestamp from state directory
     last_run_file = config.STATE_DIRECTORY.joinpath("last-run")
@@ -450,6 +392,7 @@ def main() -> None:
                 print("sync: skipping", repo.name)
                 continue
             print("sync: synchronising", repo.name)
+            repo.clone()
             codeberg.sync(repo)
             github.sync(repo)
             gitlab.sync(repo)
