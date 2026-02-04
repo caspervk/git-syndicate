@@ -200,7 +200,12 @@ class Gitlab:
                 "content-type": "application/json",
                 "private-token": self.token,
             },
-            data=json.dumps({"path": name}).encode(),
+            data=json.dumps(
+                {
+                    "path": name,
+                    "visibility": "public",
+                }
+            ).encode(),
         )
         try:
             opener.open(request)
